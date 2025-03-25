@@ -1,12 +1,6 @@
 import puppeteer, { Browser, Page } from "puppeteer";
 import { URL } from "url";
-import {
-  normalizeUrl,
-  isSameDomain,
-  isValidUrl,
-  isResourceUrl,
-  isLikelyProductOrListingUrl,
-} from "./urlUtils";
+import { normalizeUrl, isValidUrl, isResourceUrl } from "./urlUtils";
 import { model } from "./initAi";
 
 // Define interfaces
@@ -39,6 +33,16 @@ const MAX_PAGES = 100;
 let browser: Browser | null = null;
 const pagePool: Page[] = [];
 const MAX_CONCURRENT_PAGES = 3;
+
+// Add these constants at the top with other constants
+const CONCURRENT_CRAWLS = 3; // Number of parallel crawls
+const BATCH_SIZE = 5; // Size of URL batches to process together
+
+// Add this new interface
+interface PendingUrl {
+  url: string;
+  priority: number; // Higher number = higher priority
+}
 
 async function initBrowser() {
   if (!browser) {
@@ -91,152 +95,93 @@ export async function crawlWebsite(
   console.log(`Crawling only within domain: ${baseDomain}`);
   const normalizedStartUrl = normalizeUrl(startUrl);
   const visitedUrls = new Set<string>([normalizedStartUrl]);
-  const pendingUrls = [normalizedStartUrl];
+  const pendingUrls: PendingUrl[] = [{ url: normalizedStartUrl, priority: 1 }];
   const products: ProductData[] = [];
   const seenProductUrls = new Set<string>();
+  const urlCache = new Map<string, PageAnalysis>(); // Cache for analyzed URLs
 
   try {
     await initBrowser();
 
     while (pendingUrls.length > 0 && visitedUrls.size < maxPages) {
-      const currentUrl = pendingUrls.shift();
-      if (!currentUrl) continue;
+      // Sort pending URLs by priority
+      pendingUrls.sort((a, b) => b.priority - a.priority);
 
-      const startTime = Date.now();
+      // Take a batch of URLs to process
+      const currentBatch = pendingUrls.splice(0, BATCH_SIZE);
 
-      // Pre-check URL before fetching
-      if (isResourceUrl(currentUrl)) {
-        if (process.env.DEBUG) {
-          console.debug(`Skipping resource URL: ${currentUrl}`);
-        }
-        continue;
-      }
+      // Process batch in parallel
+      const batchResults = await Promise.all(
+        chunk(currentBatch, CONCURRENT_CRAWLS).map(async (urls) => {
+          return Promise.all(
+            urls.map(async ({ url }) => {
+              const startTime = Date.now();
 
-      const urlType = await isLikelyProductOrListingUrl(currentUrl);
-      console.log({ startUrl, currentUrl });
-      if (!urlType.isLikely && normalizedStartUrl !== currentUrl) {
-        if (process.env.DEBUG) {
-          console.debug(`Skipping non-product/listing URL: ${currentUrl}`);
-        }
-        continue;
-      }
-
-      console.log(`Starting crawl: ${currentUrl}`);
-
-      try {
-        const pageResult = await fetchPage(currentUrl);
-
-        // Skip if page fetch returned null (404)
-        if (!pageResult) {
-          const endTime = Date.now();
-          console.log(
-            `Skipped ${currentUrl} - Time taken: ${
-              (endTime - startTime) / 1000
-            }s`
-          );
-          continue;
-        }
-
-        const { html, links, baseUrl } = pageResult;
-
-        // Process links before analysis
-        const normalizedLinks = await Promise.all(
-          links.map(async (link) => {
-            try {
-              const normalizedLink = normalizeUrl(new URL(link, baseUrl).href);
-
-              // Check for resource URLs first
-              if (isResourceUrl(normalizedLink)) {
-                if (process.env.DEBUG) {
-                  console.debug(`Filtered resource URL: ${normalizedLink}`);
-                }
+              if (isResourceUrl(url)) {
                 return null;
               }
 
-              // Then check domain
-              const linkDomain = getBaseDomain(normalizedLink);
-              if (linkDomain !== baseDomain) return null;
+              try {
+                const pageResult = await fetchPage(url);
+                if (!pageResult) return null;
 
-              // Finally check if it's a product/listing page
-              const urlType = await isLikelyProductOrListingUrl(normalizedLink);
-              return urlType.isLikely ? normalizedLink : null;
-            } catch {
-              return null;
-            }
-          })
-        );
+                const { html, links, baseUrl } = pageResult;
 
-        const filteredLinks = normalizedLinks.filter(
-          (link): link is string =>
-            link !== null && !visitedUrls.has(link) && link !== currentUrl
-        );
+                // Use cached analysis if available
+                let pageAnalysis = urlCache.get(url);
+                if (!pageAnalysis) {
+                  pageAnalysis = await analyzePageWithGemini(html, url, links);
+                  urlCache.set(url, pageAnalysis);
+                }
 
-        // Remove redundant resource URL check since it's done above
-        if (process.env.DEBUG) {
-          console.debug(`Found ${filteredLinks.length} valid links to crawl`);
-        }
+                // Process product data
+                if (
+                  pageAnalysis.pageType === "product" &&
+                  pageAnalysis.product
+                ) {
+                  const normalizedProductUrl = normalizeUrl(url);
+                  if (!seenProductUrls.has(normalizedProductUrl)) {
+                    products.push({
+                      ...pageAnalysis.product,
+                      url: normalizedProductUrl,
+                    });
+                    seenProductUrls.add(normalizedProductUrl);
+                  }
+                }
 
-        const pageAnalysis = await analyzePageWithGemini(
-          html,
-          currentUrl,
-          filteredLinks
-        );
+                // Process and prioritize new URLs
+                const newUrls = processNewUrls(
+                  links,
+                  baseUrl,
+                  baseDomain,
+                  visitedUrls,
+                  pageAnalysis
+                );
 
-        if (pageAnalysis.pageType === "product" && pageAnalysis.product) {
-          const normalizedProductUrl = normalizeUrl(currentUrl);
-          if (!seenProductUrls.has(normalizedProductUrl)) {
-            products.push({
-              ...pageAnalysis.product,
-              url: normalizedProductUrl,
-            });
-            seenProductUrls.add(normalizedProductUrl);
-          }
-        }
+                // Add new URLs to pending queue with priorities
+                newUrls.forEach((newUrl) => {
+                  if (!visitedUrls.has(newUrl.url)) {
+                    visitedUrls.add(newUrl.url);
+                    pendingUrls.push(newUrl);
+                  }
+                });
 
-        // Process all relevant links with strict domain checking
-        const allRelevantLinks = [
-          ...(pageAnalysis.productLinks || []),
-          ...(pageAnalysis.paginationLinks || []),
-          ...(pageAnalysis.categoryLinks || []),
-          ...(pageAnalysis.otherRelevantLinks || []),
-        ]
-          .map((link) => {
-            try {
-              const normalizedLink = normalizeUrl(new URL(link, baseUrl).href);
-              return getBaseDomain(normalizedLink) === baseDomain
-                ? normalizedLink
-                : null;
-            } catch {
-              return null;
-            }
-          })
-          .filter(
-            (link): link is string => link !== null && !visitedUrls.has(link)
+                const endTime = Date.now();
+                console.log(
+                  `Completed ${url} - Time taken: ${
+                    (endTime - startTime) / 1000
+                  }s`
+                );
+
+                return pageAnalysis;
+              } catch (error) {
+                console.error(`Error processing ${url}:`, error);
+                return null;
+              }
+            })
           );
-
-        // Mark URLs as visited when adding them to pending queue
-        for (const link of allRelevantLinks) {
-          if (!visitedUrls.has(link)) {
-            visitedUrls.add(link);
-            pendingUrls.push(link);
-          }
-        }
-
-        const endTime = Date.now();
-        console.log(
-          `Completed ${currentUrl} - Time taken: ${
-            (endTime - startTime) / 1000
-          }s`
-        );
-      } catch (error) {
-        const endTime = Date.now();
-        console.error(
-          `Error processing ${currentUrl} - Time taken: ${
-            (endTime - startTime) / 1000
-          }s:`,
-          error
-        );
-      }
+        })
+      );
     }
 
     return {
@@ -244,14 +189,54 @@ export async function crawlWebsite(
       visitedUrls: Array.from(visitedUrls),
     };
   } finally {
-    // Cleanup
-    if (browser) {
-      for (const page of pagePool) {
-        await page.close();
+    await cleanup();
+  }
+}
+
+// Add these new helper functions
+function chunk<T>(array: T[], size: number): T[][] {
+  return Array.from({ length: Math.ceil(array.length / size) }, (_, i) =>
+    array.slice(i * size, i * size + size)
+  );
+}
+
+function processNewUrls(
+  links: string[],
+  baseUrl: string,
+  baseDomain: string,
+  visitedUrls: Set<string>,
+  pageAnalysis: PageAnalysis
+): PendingUrl[] {
+  const newUrls: PendingUrl[] = [];
+
+  const processUrl = (url: string, priority: number) => {
+    try {
+      const normalizedLink = normalizeUrl(new URL(url, baseUrl).href);
+      if (
+        getBaseDomain(normalizedLink) === baseDomain &&
+        !visitedUrls.has(normalizedLink)
+      ) {
+        newUrls.push({ url: normalizedLink, priority });
       }
-      await browser.close();
-      browser = null;
+    } catch {}
+  };
+
+  // Prioritize URLs based on their type
+  pageAnalysis.productLinks?.forEach((url) => processUrl(url, 3));
+  pageAnalysis.paginationLinks?.forEach((url) => processUrl(url, 2));
+  pageAnalysis.categoryLinks?.forEach((url) => processUrl(url, 2));
+  pageAnalysis.otherRelevantLinks?.forEach((url) => processUrl(url, 1));
+
+  return newUrls;
+}
+
+async function cleanup() {
+  if (browser) {
+    for (const page of pagePool) {
+      await page.close();
     }
+    await browser.close();
+    browser = null;
   }
 }
 
